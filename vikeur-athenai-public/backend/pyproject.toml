@@ -1,0 +1,66 @@
+[tool.poetry]
+name = "projet-quant-backend"
+version = "0.1.0"
+description = "Plateforme quantitative de trading crypto - backend (voir docs/ pour l'historique des phases)"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.115"
+uvicorn = { version = "^0.32", extras = ["standard"] }
+asyncpg = "^0.30"
+alembic = "^1.13"
+sqlalchemy = "^2.0"
+# Driver synchrone requis par Alembic (SQLAlchemy) - utilisé partout où
+# une migration doit réellement s'exécuter (production comprise), pas
+# seulement par les tests de migration. Découvert en déployant pour de
+# vrai : absent de l'image de production tant qu'il ne figurait que
+# dans les dépendances de développement (bug préexistant).
+psycopg2-binary = "^2.9"
+redis = "^5.1"
+httpx = "^0.27"
+websockets = "^13.1"
+scikit-learn = "^1.5"
+joblib = "^1.4"
+numpy = "^2.1"
+boto3 = "^1.35"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3"
+pytest-asyncio = "^0.24"
+pytest-cov = "^5.0"
+ruff = "^0.7"
+black = "^24.10"
+mypy = "^1.13"
+import-linter = "^2.1"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# Sans ceci, "pytest" (invocation réelle de la CI, poetry run pytest)
+# ne trouve pas les modules du dépôt (api, backtesting, decision_engine...)
+# - contrairement à "python -m pytest" qui ajoute le dossier courant au
+# chemin Python automatiquement. Absent depuis le début du projet ;
+# découvert en reproduisant l'invocation exacte de la CI.
+pythonpath = ["."]
+
+[tool.black]
+line-length = 110
+
+[tool.ruff]
+line-length = 110
+
+[tool.mypy]
+# Nécessaire car ce dépôt n'a jamais eu de __init__.py (namespace packages,
+# Phase 1) et plusieurs services partagent le même nom de module (ex.
+# api/main.py, backup/main.py, portfolio/main.py...) - sans ces deux
+# options, mypy refuse de démarrer ("Duplicate module named main").
+# Absent depuis le début du projet ; découvert en tentant de faire
+# passer la CI pour de vrai (les runs précédents échouaient tous avant
+# même ce point, cf. historique CI).
+namespace_packages = true
+explicit_package_bases = true
+ignore_missing_imports = true
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

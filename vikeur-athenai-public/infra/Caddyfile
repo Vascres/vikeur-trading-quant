@@ -1,0 +1,17 @@
+{$DOMAIN_NAME} {
+    encode gzip
+
+    handle /api/login {
+        reverse_proxy frontend:3000
+    }
+
+    handle_path /api/* {
+        reverse_proxy backend:8000
+    }
+
+    handle {
+        reverse_proxy frontend:3000
+    }
+
+    # TLS via Let's Encrypt, automatique et sans configuration supplémentaire
+}

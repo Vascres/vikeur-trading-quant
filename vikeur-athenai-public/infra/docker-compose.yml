@@ -1,0 +1,366 @@
+version: "3.9"
+
+# Réseaux : "public" traversé par le reverse proxy uniquement,
+# "internal" isolé, jamais exposé sur Internet (cf. Phase 3, §4)
+networks:
+  public:
+  internal:
+    internal: true
+
+volumes:
+  timescale_data:
+  redis_data:
+  caddy_data:
+  caddy_config:
+
+services:
+
+  reverse-proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - public
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+      - frontend
+    env_file:
+      - .env
+
+  frontend:
+    image: ${IMAGE_REGISTRY}/projet-quant-frontend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    networks:
+      - public
+    env_file:
+      - .env
+    # PUBLIC_API_URL, API_AUTH_TOKEN, SESSION_SECRET, DASHBOARD_PASSWORD_HASH
+    # sont fournis par .env - jamais préfixés NEXT_PUBLIC_, donc jamais
+    # exposés au navigateur (Module 1, §4.1).
+
+  backend:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    networks:
+      - public
+      - internal
+    env_file:
+      - .env
+    # Ce service exécute l'API FastAPI (backend/api/main.py, Phase 18) -
+    # commande par défaut du Dockerfile (uvicorn api.main:app).
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  engine:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "main.py"]
+    networks:
+      - internal
+      - public
+    env_file:
+      - .env
+    # Regroupe les 5 boucles internes (collecte, normalisation, features,
+    # décision, risque+exécution) - monolithe modulaire, Phase 2/18 §1.
+    # Jamais exposé publiquement (réseau interne uniquement).
+    healthcheck:
+      # ADR-0013 : ce service n'a pas de serveur HTTP - le HEALTHCHECK par
+      # défaut du Dockerfile (route /health de `backend`) le marquait
+      # "unhealthy" en permanence, quel que soit son état réel.
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    restart: unless-stopped
+    networks:
+      - internal
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Jamais de section "ports" ici : pas d'exposition publique (Phase 3, §4)
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks:
+      - internal
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backup:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "backup.main"]
+    networks:
+      - internal  # accès à timescaledb
+      - public    # accès Internet au stockage objet externe (Module 2)
+    env_file:
+      - .env
+    depends_on:
+      - timescaledb
+    # Dump quotidien de PostgreSQL, envoi vers le stockage objet externe,
+    # purge des sauvegardes expirées (Module 2 - Phase 3, §6).
+    healthcheck:
+      # ADR-0013 : heartbeat plutôt que la route /health de `backend`
+      # (absente ici) - prouve que la boucle est vivante, indépendamment
+      # du cycle métier qui ne tourne qu'une fois par jour.
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  monitoring:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "monitoring.main"]
+    networks:
+      - internal
+    env_file:
+      - .env
+    # Surveillance active (Phase 19) - lit events_journal, alerte via
+    # Telegram. Jamais exposé publiquement.
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  portfolio:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "portfolio.main"]
+    networks:
+      - internal  # accès DB/Redis
+      - public    # accès Internet à l'API de l'exchange (soldes réels)
+    env_file:
+      - .env
+    # Portefeuille réel (ADR-0003, ADR-0007) - remplace STARTING_CAPITAL.
+    # Seul service autorisé à interroger le solde réel de l'exchange ;
+    # risk_engine (conteneur engine) ne lit que portfolio_snapshots,
+    # jamais l'exchange directement (Architecture Cible V2, §4.1).
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  liquidation_ingest:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "liquidation_ingest.main"]
+    networks:
+      - public   # flux public Binance Futures (wss://fstream.binance.com)
+      - internal # DB/Redis
+    env_file:
+      - .env
+    # Chantier de données Liquidation Cascade (16/08/2026) - collecte
+    # SEULEMENT, aucun signal ni décision ici (cf. docstring du module).
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  journal:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "journal.main"]
+    networks:
+      - internal  # DB/Redis uniquement, aucun accès exchange
+    env_file:
+      - .env
+    # Correctif du 16/08/2026 (découvert en construisant "Why No Trade") -
+    # second consommateur du canal events:journal (le premier étant
+    # notifications, Étape 10) : persiste chaque événement dans la table
+    # events_journal, qui existait depuis la toute première migration
+    # sans jamais avoir été écrite.
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  notifications:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "notifications.main"]
+    networks:
+      - public  # api.telegram.org uniquement - DB/Redis via `internal`
+      - internal
+    env_file:
+      - .env
+    # Service de notifications (mandat §18, Étape 10, 16/08/2026) -
+    # premier consommateur du canal Redis `events:journal` (tous les
+    # autres services ne font que publier). Aucun accès DB direct,
+    # uniquement Redis (abonnement) et l'API Telegram (sortant).
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  strategy_lifecycle:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "strategy_lifecycle.main"]
+    networks:
+      - internal  # DB/Redis uniquement - aucun appel exchange (Étape 3
+                  # du plan, 16/08/2026).
+    env_file:
+      - .env
+    # Strategy Lifecycle Manager - cycle périodique (horaire par
+    # défaut), isolé du flux de décision live (contrat import-linter 13,
+    # même principe que cost_model/calibration/pair_execution) -
+    # decision_engine lit strategy_lifecycle_state en SQL direct,
+    # jamais via un import de ce service.
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  calibration:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "calibration.main"]
+    networks:
+      - internal  # ne parle qu'à la DB/Redis, jamais à un exchange
+    env_file:
+      - .env
+    # Couche de calibration probabiliste (ADR-0009) - cycle périodique,
+    # ne branche pas encore sur le flux de décision live (chantier 4).
+    healthcheck:
+      # ADR-0013 : cycle métier toutes les 6h par défaut - le heartbeat
+      # (30s) est délibérément indépendant, sinon ce service serait
+      # marqué "unhealthy" entre deux cycles alors qu'il fonctionne.
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+
+  cost_model:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "cost_model.main"]
+    networks:
+      - internal  # DB/Redis
+      - public    # ADR-0016 : appel authentifié réel vers l'API HTX -
+                  # même besoin réseau que `engine` (cf. le fix VPS
+                  # préservé "engine needs public network access for
+                  # HTX") ; à vérifier/appliquer manuellement sur le VPS
+                  # si ce fichier committé ne reflète pas encore ce besoin
+                  # pour `engine` non plus.
+    env_file:
+      - .env
+    # Service de mesure des frais réels (ADR-0016) - cycle périodique
+    # quotidien, isolé du flux de décision live (contrat import-linter 11,
+    # même principe que `calibration`).
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  pair_execution:
+    image: ${IMAGE_REGISTRY}/projet-quant-backend:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    command: ["python", "-m", "pair_execution.main"]
+    networks:
+      - internal  # DB/Redis uniquement - ADR-0021 : mode paper, aucun
+                  # appel réel à HTX pour l'instant (l'exécution réelle
+                  # à deux jambes nécessiterait sa propre attestation de
+                  # gouvernance, non créée dans ce chantier).
+    env_file:
+      - .env
+    # Pair Execution Engine (ADR-0021) - cycle périodique (60s par
+    # défaut), isolé du flux de décision live (contrat import-linter 12,
+    # même principe que cost_model/calibration) - jamais ajouté à
+    # ACTIVE_STRATEGIES, ne participe pas à la fusion de decision_engine.
+    healthcheck:
+      test: ["CMD-SHELL", "find /tmp/heartbeat -mmin -1 2>/dev/null | grep -q . || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
